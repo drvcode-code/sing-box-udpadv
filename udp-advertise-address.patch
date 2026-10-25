@@ -1,0 +1,161 @@
+diff --git a/common/listener/listener_advertise.go b/common/listener/listener_advertise.go
+new file mode 100644
+index 000000000..53e2d82a6
+--- /dev/null
++++ b/common/listener/listener_advertise.go
+@@ -0,0 +1,38 @@
++package listener
++
++import (
++	"context"
++	"net"
++	"net/netip"
++
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++type PacketListener interface {
++	ListenPacket(listenConfig net.ListenConfig, ctx context.Context, network string, address string) (net.PacketConn, error)
++}
++
++// AdvertisedPacketListener reports Addr as the local IP of the sockets it opens,
++// so a SOCKS5 UDP ASSOCIATE reply carries a public address (e.g. an EIP behind
++// 1:1 NAT) instead of the private address the relay is actually bound to.
++type AdvertisedPacketListener struct {
++	PacketListener
++	Addr netip.Addr
++}
++
++func (l *AdvertisedPacketListener) ListenPacket(listenConfig net.ListenConfig, ctx context.Context, network string, address string) (net.PacketConn, error) {
++	conn, err := l.PacketListener.ListenPacket(listenConfig, ctx, network, address)
++	if err != nil {
++		return nil, err
++	}
++	return &advertisedPacketConn{conn, l.Addr}, nil
++}
++
++type advertisedPacketConn struct {
++	net.PacketConn
++	addr netip.Addr
++}
++
++func (c *advertisedPacketConn) LocalAddr() net.Addr {
++	return M.SocksaddrFrom(c.addr, M.SocksaddrFromNet(c.PacketConn.LocalAddr()).Port).UDPAddr()
++}
+diff --git a/option/simple.go b/option/simple.go
+index f244ba18b..003b7804a 100644
+--- a/option/simple.go
++++ b/option/simple.go
+@@ -7,15 +7,17 @@ import (
+ 
+ type SocksInboundOptions struct {
+ 	ListenOptions
+-	Users          []auth.User           `json:"users,omitempty"`
+-	DomainResolver *DomainResolveOptions `json:"domain_resolver,omitempty"`
++	Users               []auth.User           `json:"users,omitempty"`
++	DomainResolver      *DomainResolveOptions `json:"domain_resolver,omitempty"`
++	UDPAdvertiseAddress *badoption.Addr       `json:"udp_advertise_address,omitempty"`
+ }
+ 
+ type HTTPMixedInboundOptions struct {
+ 	ListenOptions
+-	Users          []auth.User           `json:"users,omitempty"`
+-	DomainResolver *DomainResolveOptions `json:"domain_resolver,omitempty"`
+-	SetSystemProxy bool                  `json:"set_system_proxy,omitempty"`
++	Users               []auth.User           `json:"users,omitempty"`
++	DomainResolver      *DomainResolveOptions `json:"domain_resolver,omitempty"`
++	SetSystemProxy      bool                  `json:"set_system_proxy,omitempty"`
++	UDPAdvertiseAddress *badoption.Addr       `json:"udp_advertise_address,omitempty"`
+ 	InboundTLSOptionsContainer
+ }
+ 
+diff --git a/protocol/mixed/inbound.go b/protocol/mixed/inbound.go
+index 5b5314807..bf41e09fc 100644
+--- a/protocol/mixed/inbound.go
++++ b/protocol/mixed/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	std_bufio "bufio"
+ 	"context"
+ 	"net"
++	"net/netip"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -33,9 +34,10 @@ type Inbound struct {
+ 	inbound.Adapter
+ 	router        adapter.ConnectionRouterEx
+ 	logger        log.ContextLogger
+-	listener      *listener.Listener
+-	authenticator *auth.Authenticator
+-	tlsConfig     tls.ServerConfig
++	listener       *listener.Listener
++	packetListener socks.PacketListener
++	authenticator  *auth.Authenticator
++	tlsConfig      tls.ServerConfig
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPMixedInboundOptions) (adapter.Inbound, error) {
+@@ -61,6 +63,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		SetSystemProxy:    options.SetSystemProxy,
+ 		SystemProxySOCKS:  true,
+ 	})
++	inbound.packetListener = inbound.listener
++	if options.UDPAdvertiseAddress != nil {
++		inbound.packetListener = &listener.AdvertisedPacketListener{PacketListener: inbound.listener, Addr: options.UDPAdvertiseAddress.Build(netip.Addr{})}
++	}
+ 	return inbound, nil
+ }
+ 
+@@ -111,7 +117,7 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
+ 	}
+ 	switch headerBytes[0] {
+ 	case socks4.Version, socks5.Version:
+-		return socks.HandleConnectionEx(ctx, conn, reader, h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, metadata.Source, onClose)
++		return socks.HandleConnectionEx(ctx, conn, reader, h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.packetListener, metadata.Source, onClose)
+ 	default:
+ 		return http.HandleConnectionEx(ctx, conn, reader, h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
+ 	}
+diff --git a/protocol/socks/inbound.go b/protocol/socks/inbound.go
+index 6b8281524..eaa8766b6 100644
+--- a/protocol/socks/inbound.go
++++ b/protocol/socks/inbound.go
+@@ -4,6 +4,7 @@ import (
+ 	std_bufio "bufio"
+ 	"context"
+ 	"net"
++	"net/netip"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -29,8 +30,9 @@ type Inbound struct {
+ 	inbound.Adapter
+ 	router        adapter.ConnectionRouterEx
+ 	logger        logger.ContextLogger
+-	listener      *listener.Listener
+-	authenticator *auth.Authenticator
++	listener       *listener.Listener
++	packetListener socks.PacketListener
++	authenticator  *auth.Authenticator
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SocksInboundOptions) (adapter.Inbound, error) {
+@@ -47,6 +49,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		Listen:            options.ListenOptions,
+ 		ConnectionHandler: inbound,
+ 	})
++	inbound.packetListener = inbound.listener
++	if options.UDPAdvertiseAddress != nil {
++		inbound.packetListener = &listener.AdvertisedPacketListener{PacketListener: inbound.listener, Addr: options.UDPAdvertiseAddress.Build(netip.Addr{})}
++	}
+ 	return inbound, nil
+ }
+ 
+@@ -62,7 +68,7 @@ func (h *Inbound) Close() error {
+ }
+ 
+ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+-	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, metadata.Source, onClose)
++	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.packetListener, metadata.Source, onClose)
+ 	N.CloseOnHandshakeFailure(conn, onClose, err)
+ 	if err != nil {
+ 		if E.IsClosedOrCanceled(err) {
