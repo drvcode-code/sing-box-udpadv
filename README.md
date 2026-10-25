@@ -24,13 +24,18 @@
 
 ## 下载
 
-见 [Releases](../../releases/latest)：
+二进制就在仓库根目录，可直接下载：
 
-| 文件 | 说明 |
-|---|---|
-| `sing-box-linux-amd64` | Linux x86_64，静态编译（CGO 关闭） |
-| `sing-box-linux-arm64` | Linux ARM64，静态编译（CGO 关闭） |
-| `SHA256SUMS` | 校验值 |
+| 文件 | 说明 | 直链 |
+|---|---|---|
+| `sing-box-linux-amd64` | Linux x86_64，静态编译（CGO 关闭） | https://raw.githubusercontent.com/drvcode-code/sing-box-udpadv/main/sing-box-linux-amd64 |
+| `sing-box-linux-arm64` | Linux ARM64，静态编译（CGO 关闭） | https://raw.githubusercontent.com/drvcode-code/sing-box-udpadv/main/sing-box-linux-arm64 |
+| `SHA256SUMS` | 校验值 | |
+
+```bash
+curl -fsSL -o /usr/local/bin/sing-box https://raw.githubusercontent.com/drvcode-code/sing-box-udpadv/main/sing-box-linux-amd64
+chmod +x /usr/local/bin/sing-box
+```
 
 编译标签与官方发布版一致：`with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale`，
 版本号显示为 `1.12.8-udpadv`。
